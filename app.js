@@ -1,6 +1,6 @@
 'use strict';
 
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.2.0';
 const DB_NAME = 'conti-famiglia';
 const STORE = 'records';
 
@@ -69,9 +69,10 @@ async function save(...list) {
   const now = Date.now();
   list.forEach(r => { r.updatedAt = now; records.set(r.id, r); });
   await dbPut(list);
+  markPending(list.map(r => r.id));
 }
 
-// Per-device preferences (not synced): who uses this phone, last backup date.
+// Per-device preferences (not synced): who uses this phone, last backup date, sync keys.
 const pref = {
   get(key, fallback = '') {
     try { return localStorage.getItem('cf-' + key) ?? fallback; } catch { return fallback; }
@@ -185,6 +186,7 @@ const ui = {
   ref: now,
   listMonth: { y: now.getFullYear(), m: now.getMonth() },
   listCat: '',
+  who: '',            // '' = everyone; shared by Riepilogo, Movimenti and Andamento
   trendYear: now.getFullYear(),
   trendCat: '',
   budgetYear: now.getFullYear(),
@@ -241,6 +243,36 @@ function catOptions(selected) {
     .map(c => `<option value="${c.id}" ${c.id === selected ? 'selected' : ''}>${esc(c.icon)} ${esc(c.name)}</option>`).join('');
 }
 
+// Everyone who registered expenses, plus whoever uses this phone.
+function people() {
+  return [...new Set([pref.get('name'), ...expenses().map(e => e.who)].filter(Boolean))].sort((a, b) => a.localeCompare(b));
+}
+
+const byWho = list => ui.who ? list.filter(e => e.who === ui.who) : list;
+
+function whoFilterHTML() {
+  const names = people();
+  if (names.length < 2 && !ui.who) return '';
+  return `<div class="seg" role="group" aria-label="Persona">${['', ...names].map(w =>
+    `<button data-action="who" data-value="${esc(w)}" aria-pressed="${ui.who === w}">${w ? esc(w) : 'Tutti'}</button>`).join('')}</div>`;
+}
+
+// "Marco 50,00 € · Laura 30,00 €" when looking at everyone's expenses together.
+function perPersonHTML(list) {
+  if (ui.who) return '';
+  const totals = new Map();
+  list.forEach(e => { const w = e.who || 'Non indicato'; totals.set(w, (totals.get(w) || 0) + e.amount); });
+  if (totals.size < 2) return '';
+  return [...totals].sort((a, b) => b[1] - a[1]).map(([w, v]) => `${esc(w)} ${fmt(v)}`).join(' · ');
+}
+
+// With one person selected the budget is still the family's, so show their share of it.
+function shareHTML(spent, budget) {
+  if (!ui.who) return statusHTML(spent, budget);
+  if (!budget) return '<span class="muted">Nessun budget</span>';
+  return `<span class="muted">${Math.round(spent / budget * 100)}% del budget di famiglia</span>`;
+}
+
 function bannersHTML() {
   const out = [];
   if (!pref.get('name')) {
@@ -251,11 +283,9 @@ function bannersHTML() {
     out.push(`<div class="banner"><span>Non hai ancora impostato il budget del ${new Date().getFullYear()}.</span>
       <button class="btn" data-action="go" data-view="settings">Imposta</button></div>`);
   }
-  const last = Number(pref.get('lastExport', 0));
-  const days = Math.floor((Date.now() - last) / 864e5);
-  if (expenses().length && days >= 7) {
-    out.push(`<div class="banner"><span>${last ? `Ultimo backup ${days} giorni fa.` : 'Non hai mai fatto un backup.'} Esportalo per sincronizzarti con l'altro iPhone.</span>
-      <button class="btn" data-action="export">Esporta</button></div>`);
+  if (!sync) {
+    out.push(`<div class="banner"><span>Attiva la sincronizzazione per vedere subito le spese dell'altro iPhone.</span>
+      <button class="btn" data-action="go" data-view="settings">Attiva</button></div>`);
   }
   return out.join('');
 }
@@ -264,7 +294,9 @@ function bannersHTML() {
 
 function renderSummary() {
   const p = periodRange(ui.period, ui.ref);
-  const spent = sumByCat(expensesBetween(p.from, p.to));
+  const exps = byWho(expensesBetween(p.from, p.to));
+  const spent = sumByCat(exps);
+  const split = perPersonHTML(exps);
   const ids = new Set([...categories().map(c => c.id), ...spent.keys()]);
   const rows = [...ids]
     .map(id => ({ cat: catInfo(id), spent: spent.get(id) || 0, budget: Math.round(budgetFor(p.year, id) * p.factor) }))
@@ -281,16 +313,19 @@ function renderSummary() {
 
   $('#view-summary').innerHTML = `
     <h1>Riepilogo</h1>
+    ${sync ? `<p class="sync-badge" id="sync-badge">${syncStatusHTML()}</p>` : ''}
     ${bannersHTML()}
     <div class="seg">${seg}</div>
+    ${whoFilterHTML()}
     ${navHTML('summary-shift', p.label)}
     ${isCurrent ? '' : '<div class="today-link"><button class="link" data-action="summary-today">Torna a oggi</button></div>'}
     <section class="card hero">
-      <div class="label">Speso</div>
+      <div class="label">${ui.who ? 'Speso da ' + esc(ui.who) : 'Speso in totale'}</div>
       <div class="big num">${fmt(totSpent)}</div>
-      <div class="sub">${totBud ? `su ${fmt(totBud)} di budget` : 'Nessun budget per questo periodo'}</div>
+      ${split ? `<div class="sub num">${split}</div>` : ''}
+      <div class="sub">${totBud ? `su ${fmt(totBud)} di budget${ui.who ? ' di famiglia' : ''}` : 'Nessun budget per questo periodo'}</div>
       ${progressHTML(totSpent, totBud, elapsed)}
-      <div class="sub">${statusHTML(totSpent, totBud)}</div>
+      <div class="sub">${shareHTML(totSpent, totBud)}</div>
       ${elapsed != null ? '<p class="hint">La tacca nera indica a che punto del periodo sei oggi: se la barra la supera, stai spendendo più del previsto.</p>' : ''}
     </section>
     <section class="card">
@@ -300,7 +335,7 @@ function renderSummary() {
           <div class="row-head"><span>${esc(r.cat.icon)} ${esc(r.cat.name)}</span>
             <span class="num">${fmt(r.spent)}${r.budget ? `<small> / ${fmt(r.budget)}</small>` : ''}</span></div>
           ${progressHTML(r.spent, r.budget, null)}
-          <div class="row-foot">${statusHTML(r.spent, r.budget)}</div>
+          <div class="row-foot">${shareHTML(r.spent, r.budget)}</div>
         </div>`).join('') : '<p class="empty">Nessuna spesa in questo periodo.<br>Tocca + per aggiungerne una.</p>'}
     </section>`;
 }
@@ -319,7 +354,7 @@ function renderList() {
   const { y, m } = ui.listMonth;
   const from = isoDate(new Date(y, m, 1));
   const to = isoDate(new Date(y, m + 1, 1));
-  let list = expensesBetween(from, to);
+  let list = byWho(expensesBetween(from, to));
   if (ui.listCat) list = list.filter(e => e.catId === ui.listCat);
   list.sort((a, b) => b.date.localeCompare(a.date) || (b.createdAt || 0) - (a.createdAt || 0));
 
@@ -341,6 +376,7 @@ function renderList() {
 
   $('#view-list').innerHTML = `
     <h1>Movimenti</h1>
+    ${whoFilterHTML()}
     ${navHTML('list-shift', `${MONTHS[m]} ${y}`)}
     <select class="filter" id="list-cat" aria-label="Filtra per categoria">${catOptions(ui.listCat)}</select>
     <div class="month-total"><span class="muted">${list.length} ${list.length === 1 ? 'spesa' : 'spese'}</span><b class="num">${fmt(sum(list.map(e => e.amount)))}</b></div>
@@ -355,7 +391,7 @@ function openEditor(id) {
   if (e && !cats.some(c => c.id === e.catId)) cats.push(catInfo(e.catId));
   const selected = e ? e.catId : pref.get('lastCat');
   const name = pref.get('name');
-  const people = [...new Set([name, ...expenses().map(x => x.who)].filter(Boolean))];
+  const names = people();
 
   const sheet = $('#sheet .sheet');
   sheet.innerHTML = `
@@ -374,7 +410,7 @@ function openEditor(id) {
         <label>Data<input class="field" type="date" name="date" value="${e ? e.date : today()}" required></label>
         <label>Chi ha pagato<input class="field" name="who" list="people" value="${esc(e ? e.who : name)}"></label>
       </div>
-      <datalist id="people">${people.map(p => `<option value="${esc(p)}">`).join('')}</datalist>
+      <datalist id="people">${names.map(p => `<option value="${esc(p)}">`).join('')}</datalist>
       <label class="full">Nota (facoltativa)<input class="field" name="note" value="${esc(e ? e.note : '')}" placeholder="Es. Esselunga, bolletta luce…"></label>
       <p class="err" id="form-err"></p>
       <button type="submit" class="btn block">Salva</button>
@@ -474,8 +510,9 @@ function barChart(id, bars, ref) {
     <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Grafico a barre">${svg}</svg></div>`;
 }
 
-function tipHTML(title, spent, budget) {
-  return `<b>${esc(title)}</b><br>Speso: ${fmt(spent)}` +
+function tipHTML(title, spent, budget, items) {
+  const split = items ? perPersonHTML(items) : '';
+  return `<b>${esc(title)}</b><br>Speso: ${fmt(spent)}` + (split ? `<br>${split}` : '') +
     (budget ? `<br>Budget: ${fmt(budget)}<br>${spent > budget ? `⚠ Oltre di ${fmt(spent - budget)}` : `Restano ${fmt(budget - spent)}`}` : '');
 }
 
@@ -501,14 +538,15 @@ function hideTips() {
 function renderTrend() {
   const y = ui.trendYear;
   const cat = ui.trendCat;
-  const list = cat ? expenses().filter(e => e.catId === cat) : expenses();
+  const list = byWho(cat ? expenses().filter(e => e.catId === cat) : expenses());
   const annual = cat ? budgetFor(y, cat) : totalBudget(y);
   const monthBudget = Math.round(annual / 12);
 
   const months = MONTHS.map((name, m) => {
     const from = isoDate(new Date(y, m, 1)), to = isoDate(new Date(y, m + 1, 1));
-    const value = sum(list.filter(e => e.date >= from && e.date < to).map(e => e.amount));
-    return { label: MONTHS_SHORT[m], value, tip: tipHTML(`${name} ${y}`, value, monthBudget), name };
+    const items = list.filter(e => e.date >= from && e.date < to);
+    const value = sum(items.map(e => e.amount));
+    return { label: MONTHS_SHORT[m], value, tip: tipHTML(`${name} ${y}`, value, monthBudget, items), name };
   });
   const yearSpent = sum(months.map(b => b.value));
 
@@ -519,15 +557,17 @@ function renderTrend() {
   for (let i = 11; i >= 0; i--) {
     const s = addDays(thisWeek, -7 * i);
     const from = isoDate(s), to = isoDate(addDays(s, 7));
-    const value = sum(list.filter(e => e.date >= from && e.date < to).map(e => e.amount));
+    const items = list.filter(e => e.date >= from && e.date < to);
+    const value = sum(items.map(e => e.amount));
     weeks.push({ label: `${s.getDate()}/${s.getMonth() + 1}`, value,
-      tip: tipHTML(`Settimana dal ${shortDay(s)}`, value, weekBudget) });
+      tip: tipHTML(`Settimana dal ${shortDay(s)}`, value, weekBudget, items) });
   }
 
   const key = budget => `<div class="key"><span><i class="sw"></i>Speso</span>${budget ? `<span><i class="dash"></i>Budget ${fmt(budget)}</span>` : ''}</div>`;
 
   $('#view-trend').innerHTML = `
     <h1>Andamento</h1>
+    ${whoFilterHTML()}
     <select class="filter" id="trend-cat" aria-label="Categoria">${catOptions(cat)}</select>
     ${navHTML('trend-shift', String(y))}
     <section class="card">
@@ -589,11 +629,12 @@ function renderSettings() {
       <p class="hint">Per l'icona puoi usare qualsiasi emoji.</p>
     </section>
 
+    ${syncCardHTML()}
+
     <section class="card">
-      <h2>Backup e sincronizzazione</h2>
-      <p class="hint" style="margin-top:0">I dati sono salvati solo su questo iPhone. Per allinearti con l'altro telefono:
-        <b>Esporta</b> e salva il file nella cartella iCloud Drive condivisa, poi dall'altro iPhone tocca <b>Importa</b> e scegli quel file.
-        Le spese vengono unite senza doppioni.</p>
+      <h2>Backup</h2>
+      <p class="hint" style="margin-top:0">Una copia di sicurezza su file, da salvare in iCloud Drive o sul computer.
+        Con <b>Importa</b> la recuperi in qualsiasi momento: le spese vengono unite senza doppioni.</p>
       <div class="btns" style="margin-top:12px">
         <button class="btn" data-action="export">Esporta backup</button>
         <button class="btn secondary" data-action="import">Importa backup</button>
@@ -698,6 +739,7 @@ async function importBackup(file) {
   const incoming = data.records.filter(r => r && r.id && r.type && (r.updatedAt || 0) > ((records.get(r.id) || {}).updatedAt || 0));
   incoming.forEach(r => records.set(r.id, r));
   await dbPut(incoming);
+  markPending(incoming.map(r => r.id));
   const newExpenses = incoming.filter(r => r.type === 'expense').length;
   alert(incoming.length
     ? `Importazione completata${data.by ? ' dal backup di ' + data.by : ''}: ${newExpenses} ${newExpenses === 1 ? 'spesa nuova o modificata' : 'spese nuove o modificate'}` +
@@ -717,6 +759,242 @@ function exportCSV() {
   shareOrDownload(new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv' }), `spese-${y}.csv`);
 }
 
+/* ---------- Sync ----------
+   Records are encrypted on the phone (AES-GCM) with a key derived from the
+   family password, then stored in a Firebase Realtime Database through its
+   REST API. The server only ever sees ciphertext: record ids are HMAC'd and
+   the family folder name is derived from the password too, so the two
+   phones find each other just by typing the same password. */
+
+const SYNC_INTERVAL = 15000;
+const SYNC_SALT = 'conti-famiglia/sync/v1';
+const textEnc = new TextEncoder();
+const textDec = new TextDecoder();
+
+let sync = null;          // { url, fid, aes: CryptoKey, mac: CryptoKey }
+let syncState = { busy: false, ok: true, error: '' };
+let syncTimer, syncAgain = false;
+
+const pending = new Set((() => { try { return JSON.parse(pref.get('syncPending', '[]')); } catch { return []; } })());
+const savePending = () => pref.set('syncPending', JSON.stringify([...pending]));
+
+function markPending(ids) {
+  if (!sync) return;
+  ids.forEach(id => pending.add(id));
+  savePending();
+  scheduleSync();
+}
+
+function b64(bytes) {
+  let s = '';
+  new Uint8Array(bytes).forEach(b => { s += String.fromCharCode(b); });
+  return btoa(s);
+}
+const unb64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+const hex = bytes => [...new Uint8Array(bytes)].map(b => b.toString(16).padStart(2, '0')).join('');
+
+async function deriveSyncKeys(password) {
+  const base = await crypto.subtle.importKey('raw', textEnc.encode(password.normalize('NFC')), 'PBKDF2', false, ['deriveBits']);
+  const bits = new Uint8Array(await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', hash: 'SHA-256', salt: textEnc.encode(SYNC_SALT), iterations: 310000 }, base, 768));
+  return { aes: b64(bits.slice(0, 32)), mac: b64(bits.slice(32, 64)), fid: hex(bits.slice(64, 96)) };
+}
+
+async function loadSync() {
+  let cfg = null;
+  try { cfg = JSON.parse(pref.get('sync') || 'null'); } catch { cfg = null; }
+  if (!cfg || !crypto.subtle) { sync = null; return; }
+  sync = {
+    url: cfg.url,
+    fid: cfg.fid,
+    aes: await crypto.subtle.importKey('raw', unb64(cfg.aes), 'AES-GCM', false, ['encrypt', 'decrypt']),
+    mac: await crypto.subtle.importKey('raw', unb64(cfg.mac), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']),
+  };
+}
+
+const familyCode = fid => fid.slice(0, 6).toUpperCase().replace(/^(...)/, '$1-');
+const remoteBase = () => `${sync.url}/f/${sync.fid}/r`;
+
+async function remoteKey(id) {
+  return hex(await crypto.subtle.sign('HMAC', sync.mac, textEnc.encode(id))).slice(0, 40);
+}
+
+async function encryptRecord(r) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const data = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, sync.aes, textEnc.encode(JSON.stringify(r)));
+  return { d: b64(data), iv: b64(iv) };
+}
+
+async function decryptRecord(v) {
+  const data = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(v.iv) }, sync.aes, unb64(v.d));
+  return JSON.parse(textDec.decode(data));
+}
+
+async function request(url, options) {
+  let res;
+  try { res = await fetch(url, options); } catch { throw new Error(navigator.onLine ? 'server non raggiungibile' : 'offline'); }
+  if (res.status === 401 || res.status === 403) throw new Error('accesso negato: controlla le regole del database');
+  if (!res.ok) throw new Error('errore del server ' + res.status);
+  return res.json();
+}
+
+async function pushPending() {
+  const ids = [...pending];
+  for (let i = 0; i < ids.length; i += 100) {
+    const chunk = ids.slice(i, i + 100).map(id => records.get(id)).filter(Boolean);
+    const body = {};
+    for (const r of chunk) body[await remoteKey(r.id)] = { u: { '.sv': 'timestamp' }, ...(await encryptRecord(r)) };
+    if (chunk.length) await request(remoteBase() + '.json', { method: 'PATCH', body: JSON.stringify(body) });
+    // Keep the id pending if it was edited again while we were uploading.
+    chunk.forEach(r => { if (records.get(r.id) === r) pending.delete(r.id); });
+    ids.slice(i, i + 100).forEach(id => { if (!records.has(id)) pending.delete(id); });
+    savePending();
+  }
+}
+
+async function pull() {
+  const cursor = Number(pref.get('syncCursor', 0));
+  // Re-read a few minutes back: harmless (merge is idempotent) and covers in-flight writes.
+  const query = cursor ? `?orderBy=%22u%22&startAt=${cursor - 300000}` : '';
+  const data = (await request(remoteBase() + '.json' + query)) || {};
+  let max = cursor;
+  const changed = [];
+  for (const v of Object.values(data)) {
+    if (!v || !v.d || !v.iv) continue;
+    max = Math.max(max, v.u || 0);
+    let r;
+    try { r = await decryptRecord(v); } catch { continue; }
+    const local = records.get(r.id);
+    if (!local || (r.updatedAt || 0) > (local.updatedAt || 0)) { records.set(r.id, r); changed.push(r); }
+  }
+  if (changed.length) await dbPut(changed);
+  pref.set('syncCursor', max);
+  return changed;
+}
+
+function scheduleSync(delay = 400) {
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(runSync, delay);
+}
+
+async function runSync() {
+  if (!sync) return;
+  if (syncState.busy) { syncAgain = true; return; }
+  syncState = { busy: true, ok: syncState.ok, error: syncState.error };
+  updateSyncStatus();
+  let changed = [];
+  try {
+    await pushPending();
+    changed = await pull();
+    syncState = { busy: false, ok: true, error: '' };
+    pref.set('syncLast', Date.now());
+  } catch (e) {
+    syncState = { busy: false, ok: false, error: e.message };
+  }
+  if (changed.length) onRemoteChanges(changed);
+  updateSyncStatus();
+  if (syncAgain) { syncAgain = false; scheduleSync(0); }
+}
+
+function onRemoteChanges(changed) {
+  const me = pref.get('name');
+  const fromOthers = changed.filter(r => r.type === 'expense' && r.who && r.who !== me);
+  if (fromOthers.length) {
+    const names = [...new Set(fromOthers.map(r => r.who))].join(' e ');
+    toast(fromOthers.length === 1 ? `Nuova spesa da ${names}` : `${fromOthers.length} aggiornamenti da ${names}`);
+  }
+  // Don't redraw under the user's fingers: the sheet or a settings field being edited.
+  const editing = !$('#sheet').hidden || (ui.view === 'settings' && document.activeElement && document.activeElement.matches('input, select'));
+  if (!editing) refresh();
+}
+
+function syncStatusHTML() {
+  if (!sync) return '';
+  if (syncState.busy) return '<span class="muted">🔄 Sincronizzazione…</span>';
+  const waiting = pending.size ? ` · ${pending.size} ${pending.size === 1 ? 'modifica' : 'modifiche'} in attesa` : '';
+  if (!syncState.ok) return `<span class="warn">⚠ Non sincronizzato (${esc(syncState.error)})${waiting}</span>`;
+  const last = Number(pref.get('syncLast', 0));
+  return `<span class="muted">✓ Sincronizzato${last ? ' alle ' + new Date(last).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' }) : ''}${waiting}</span>`;
+}
+
+function updateSyncStatus() {
+  document.querySelectorAll('#sync-badge, #sync-status').forEach(el => { el.innerHTML = syncStatusHTML(); });
+}
+
+function syncCardHTML() {
+  if (sync) {
+    return `<section class="card">
+      <h2>Sincronizzazione automatica</h2>
+      <p id="sync-status">${syncStatusHTML()}</p>
+      <p class="hint">Codice famiglia: <b class="num">${familyCode(sync.fid)}</b><br>
+        Deve essere uguale sui due iPhone: se è diverso, la password inserita non è la stessa.</p>
+      <div class="btns" style="margin-top:12px">
+        <button class="btn" data-action="sync-now">Sincronizza ora</button>
+        <button class="btn secondary" data-action="sync-off">Disattiva</button>
+      </div>
+    </section>`;
+  }
+  return `<section class="card">
+    <h2>Sincronizzazione automatica</h2>
+    <p class="hint" style="margin-top:0">Le spese inserite su un iPhone compaiono sull'altro dopo pochi secondi.
+      Tutto viene cifrato sul telefono con la password di famiglia: il server vede solo dati illeggibili.</p>
+    <form id="sync-form" autocomplete="off">
+      <label class="full">Indirizzo del database<input class="field" name="url" inputmode="url" autocapitalize="off" spellcheck="false"
+        placeholder="https://….firebasedatabase.app" value="${esc(pref.get('syncUrl'))}"></label>
+      <label class="full">Password di famiglia<input class="field" name="pw" type="password" autocomplete="new-password"></label>
+      <label class="full">Ripeti la password<input class="field" name="pw2" type="password" autocomplete="new-password"></label>
+      <p class="err" id="sync-err"></p>
+      <button class="btn block" type="submit">Attiva sincronizzazione</button>
+    </form>
+    <p class="hint">Usate la stessa identica password su entrambi gli iPhone (almeno 10 caratteri).
+      Non si può recuperare: scrivetela in un posto sicuro.</p>
+  </section>`;
+}
+
+async function enableSync(form) {
+  const err = $('#sync-err');
+  const url = form.url.value.trim().replace(/\/+$/, '');
+  const pw = form.pw.value;
+  if (!/^https:\/\/[a-z0-9.-]+\.(firebasedatabase\.app|firebaseio\.com)$/i.test(url) && !/^http:\/\/localhost:\d+$/.test(url)) {
+    err.textContent = "L'indirizzo deve essere quello del database Firebase (…firebasedatabase.app).";
+    return;
+  }
+  if (pw.length < 10) { err.textContent = 'La password deve avere almeno 10 caratteri.'; return; }
+  if (pw !== form.pw2.value) { err.textContent = 'Le due password non coincidono.'; return; }
+  if (!crypto.subtle) { err.textContent = "La cifratura non è disponibile: apri l'app dall'indirizzo https."; return; }
+
+  const button = form.querySelector('button[type=submit]');
+  button.disabled = true;
+  button.textContent = 'Attivazione…';
+  err.textContent = '';
+  try {
+    const keys = await deriveSyncKeys(pw);
+    await request(`${url}/f/${keys.fid}/r.json?shallow=true`);
+    pref.set('syncUrl', url);
+    pref.set('sync', JSON.stringify({ url, ...keys }));
+    pref.set('syncCursor', 0);
+    await loadSync();
+    markPending([...records.keys()]);
+    await runSync();
+    renderSettings();
+    toast('Sincronizzazione attivata');
+  } catch (e) {
+    err.textContent = 'Attivazione non riuscita: ' + e.message + '.';
+    button.disabled = false;
+    button.textContent = 'Attiva sincronizzazione';
+  }
+}
+
+function disableSync() {
+  if (!confirm('Disattivare la sincronizzazione su questo iPhone? I dati restano sul telefono.')) return;
+  sync = null;
+  pending.clear();
+  savePending();
+  pref.set('sync', '');
+  pref.set('syncCursor', 0);
+  renderSettings();
+}
+
 /* ---------- Events ---------- */
 
 function bindEvents() {
@@ -730,9 +1008,12 @@ function bindEvents() {
       case 'go': show(el.dataset.view); break;
       case 'add': openEditor(null); break;
       case 'edit': openEditor(el.dataset.id); break;
-      case 'close': closeEditor(); break;
+      case 'close': closeEditor(); refresh(); break;
+      case 'sync-now': scheduleSync(0); break;
+      case 'sync-off': disableSync(); break;
       case 'delete-expense': deleteExpense(); break;
       case 'period': ui.period = el.dataset.value; renderSummary(); break;
+      case 'who': ui.who = el.dataset.value; refresh(); break;
       case 'summary-shift': shiftSummary(dir); renderSummary(); break;
       case 'summary-today': ui.ref = new Date(); renderSummary(); break;
       case 'list-shift': {
@@ -766,9 +1047,14 @@ function bindEvents() {
 
   document.addEventListener('submit', ev => {
     if (ev.target.id === 'expense-form') { ev.preventDefault(); submitExpense(ev.target); }
+    if (ev.target.id === 'sync-form') { ev.preventDefault(); enableSync(ev.target); }
   });
 
-  $('#sheet').addEventListener('click', ev => { if (ev.target.id === 'sheet') closeEditor(); });
+  $('#sheet').addEventListener('click', ev => { if (ev.target.id === 'sheet') { closeEditor(); refresh(); } });
+
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') scheduleSync(0); });
+  window.addEventListener('online', () => scheduleSync(0));
+  setInterval(() => { if (document.visibilityState === 'visible') scheduleSync(0); }, SYNC_INTERVAL);
 }
 
 async function init() {
@@ -780,8 +1066,10 @@ async function init() {
     await dbPut(defaults);
   }
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
+  await loadSync();
   bindEvents();
   show('summary');
+  scheduleSync(0);
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
 }
 

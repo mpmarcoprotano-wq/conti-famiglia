@@ -87,6 +87,9 @@ h2 { font-size: 17px; margin: 0 0 12px; }
   border: 1px solid var(--border);
 }
 
+.sync-badge { font-size: 14px; margin: -8px 0 12px; }
+#sync-status { margin: 0; font-size: 15px; }
+
 /* Banners */
 .banner {
   display: flex; gap: 12px; align-items: center; justify-content: space-between;

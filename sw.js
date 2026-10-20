@@ -1,6 +1,6 @@
 // Offline support: serve the app from cache, refresh the cache in the background.
 // Bump CACHE when releasing a new version to drop old files.
-const CACHE = 'conti-famiglia-v1';
+const CACHE = 'conti-famiglia-v3';
 const ASSETS = [
   './',
   './index.html',
@@ -26,7 +26,10 @@ self.addEventListener('activate', event => {
 
 self.addEventListener('fetch', event => {
   const req = event.request;
-  if (req.method !== 'GET' || new URL(req.url).origin !== location.origin) return;
+  const url = new URL(req.url);
+  // Only the app's own files: never cache data requests.
+  const isAsset = ASSETS.some(a => new URL(a, self.registration.scope).pathname === url.pathname);
+  if (req.method !== 'GET' || url.origin !== location.origin || !(isAsset || req.mode === 'navigate')) return;
   event.respondWith(
     caches.open(CACHE).then(async cache => {
       const cached = await cache.match(req, { ignoreSearch: true });
