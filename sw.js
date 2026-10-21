@@ -1,6 +1,6 @@
 // Offline support: serve the app from cache, refresh the cache in the background.
 // Bump CACHE when releasing a new version to drop old files.
-const CACHE = 'conti-famiglia-v3';
+const CACHE = 'conti-famiglia-v4';
 const ASSETS = [
   './',
   './index.html',

@@ -1,6 +1,6 @@
 'use strict';
 
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.3.0';
 const DB_NAME = 'conti-famiglia';
 const STORE = 'records';
 
@@ -27,7 +27,7 @@ const DEFAULT_CATEGORIES = [
 
 /* ---------- Storage ----------
    Every piece of data is a record {id, type, updatedAt, deleted?, ...}
-   of type 'category', 'budget' or 'expense'. Deletions are kept as
+   of type 'category', 'budget', 'expense' or 'income' (a salary). Deletions are kept as
    tombstones so they survive a merge with the other phone's backup. */
 
 const records = new Map();
@@ -88,6 +88,14 @@ const live = type => [...records.values()].filter(r => r.type === type && !r.del
 const categories = () => live('category').sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
 const expenses = () => live('expense');
 const expensesBetween = (from, to) => expenses().filter(e => e.date >= from && e.date < to);
+const incomes = () => live('income');
+const incomesBetween = (from, to) => incomes().filter(e => e.date >= from && e.date < to);
+const isIncome = r => r.type === 'income';
+
+const KINDS = {
+  expense: { title: 'spesa', who: 'Chi ha pagato', note: 'Es. Esselunga, bolletta luce…' },
+  income: { title: 'stipendio', who: 'Chi lo riceve', note: 'Es. Stipendio ottobre, tredicesima…' },
+};
 const sum = list => list.reduce((a, b) => a + b, 0);
 
 function budgetFor(year, catId) {
@@ -238,14 +246,15 @@ function navHTML(action, label) {
   </div>`;
 }
 
-function catOptions(selected) {
-  return `<option value="">Tutte le categorie</option>` + categories()
+function catOptions(selected, withIncome) {
+  return `<option value="">${withIncome ? 'Tutti i movimenti' : 'Tutte le categorie'}</option>` +
+    (withIncome ? `<option value="income" ${selected === 'income' ? 'selected' : ''}>💶 Solo stipendi</option>` : '') + categories()
     .map(c => `<option value="${c.id}" ${c.id === selected ? 'selected' : ''}>${esc(c.icon)} ${esc(c.name)}</option>`).join('');
 }
 
-// Everyone who registered expenses, plus whoever uses this phone.
+// Everyone who registered expenses or salaries, plus whoever uses this phone.
 function people() {
-  return [...new Set([pref.get('name'), ...expenses().map(e => e.who)].filter(Boolean))].sort((a, b) => a.localeCompare(b));
+  return [...new Set([pref.get('name'), ...expenses().map(e => e.who), ...incomes().map(e => e.who)].filter(Boolean))].sort((a, b) => a.localeCompare(b));
 }
 
 const byWho = list => ui.who ? list.filter(e => e.who === ui.who) : list;
@@ -307,6 +316,10 @@ function renderSummary() {
   const t = today();
   const isCurrent = p.from <= t && t < p.to;
   const elapsed = isCurrent && totBud ? (daysBetween(p.from, t) + 1) / daysBetween(p.from, p.to) : null;
+  const ins = byWho(incomesBetween(p.from, p.to));
+  const earned = sum(ins.map(e => e.amount));
+  const inSplit = perPersonHTML(ins);
+  const saved = earned - totSpent;
 
   const seg = [['week', 'Settimana'], ['month', 'Mese'], ['year', 'Anno']]
     .map(([k, l]) => `<button data-action="period" data-value="${k}" aria-pressed="${ui.period === k}">${l}</button>`).join('');
@@ -327,6 +340,17 @@ function renderSummary() {
       ${progressHTML(totSpent, totBud, elapsed)}
       <div class="sub">${shareHTML(totSpent, totBud)}</div>
       ${elapsed != null ? '<p class="hint">La tacca nera indica a che punto del periodo sei oggi: se la barra la supera, stai spendendo più del previsto.</p>' : ''}
+    </section>
+    <section class="card">
+      <h2>Stipendi e risparmio</h2>
+      <div class="flow"><span>💶 Stipendi</span><b class="num in">${fmt(earned)}</b></div>
+      ${inSplit ? `<div class="flow-sub num">${inSplit}</div>` : ''}
+      <div class="flow"><span>🧾 Spese</span><b class="num">${fmt(totSpent)}</b></div>
+      <div class="flow total"><span>${saved >= 0 ? 'Risparmiato' : 'Speso più degli stipendi'}</span>
+        <b class="num ${saved >= 0 ? 'in' : 'warn'}">${fmt(Math.abs(saved))}</b></div>
+      <p class="hint">${earned
+        ? (saved >= 0 ? `Hai messo da parte il ${Math.round(saved / earned * 100)}% degli stipendi.` : 'Le spese superano gli stipendi di questo periodo.')
+        : 'Nessuno stipendio in questo periodo. Tocca + e scegli «Stipendio» per registrarlo.'}</p>
     </section>
     <section class="card">
       <h2>Per categoria</h2>
@@ -354,18 +378,30 @@ function renderList() {
   const { y, m } = ui.listMonth;
   const from = isoDate(new Date(y, m, 1));
   const to = isoDate(new Date(y, m + 1, 1));
-  let list = byWho(expensesBetween(from, to));
-  if (ui.listCat) list = list.filter(e => e.catId === ui.listCat);
+  let list = byWho([...expensesBetween(from, to), ...incomesBetween(from, to)]);
+  if (ui.listCat === 'income') list = list.filter(isIncome);
+  else if (ui.listCat) list = list.filter(e => e.catId === ui.listCat);
   list.sort((a, b) => b.date.localeCompare(a.date) || (b.createdAt || 0) - (a.createdAt || 0));
+  const outs = list.filter(e => !isIncome(e));
+  const ins = list.filter(isIncome);
 
   const days = new Map();
   list.forEach(e => { if (!days.has(e.date)) days.set(e.date, []); days.get(e.date).push(e); });
 
   const body = [...days].map(([date, items]) => {
     const d = parseDate(date);
+    const dayIn = sum(items.filter(isIncome).map(e => e.amount));
+    const dayOut = sum(items.filter(e => !isIncome(e)).map(e => e.amount));
+    const totals = [dayIn ? `<span class="in">+${fmt(dayIn)}</span>` : '', dayOut ? fmt(dayOut) : ''].filter(Boolean).join(' · ');
     return `<div class="day"><span>${DAYS[d.getDay()]} ${d.getDate()} ${MONTHS[d.getMonth()].toLowerCase()}</span>
-        <span class="num">${fmt(sum(items.map(e => e.amount)))}</span></div>
+        <span class="num">${totals}</span></div>
       <div class="items">${items.map(e => {
+        if (isIncome(e)) {
+          return `<button class="item" data-action="edit" data-id="${e.id}">
+            <span class="ico">💶</span>
+            <span class="txt"><b>${esc(e.note || 'Stipendio')}</b><small>Stipendio${e.who ? ' · ' + esc(e.who) : ''}</small></span>
+            <span class="num in">+${fmt(e.amount)}</span></button>`;
+        }
         const c = catInfo(e.catId);
         return `<button class="item" data-action="edit" data-id="${e.id}">
           <span class="ico">${esc(c.icon)}</span>
@@ -378,17 +414,19 @@ function renderList() {
     <h1>Movimenti</h1>
     ${whoFilterHTML()}
     ${navHTML('list-shift', `${MONTHS[m]} ${y}`)}
-    <select class="filter" id="list-cat" aria-label="Filtra per categoria">${catOptions(ui.listCat)}</select>
-    <div class="month-total"><span class="muted">${list.length} ${list.length === 1 ? 'spesa' : 'spese'}</span><b class="num">${fmt(sum(list.map(e => e.amount)))}</b></div>
-    ${body || '<p class="empty">Nessuna spesa in questo mese.</p>'}`;
+    <select class="filter" id="list-cat" aria-label="Filtra per categoria">${catOptions(ui.listCat, true)}</select>
+    ${ui.listCat === 'income' ? '' : `<div class="month-total"><span class="muted">${outs.length} ${outs.length === 1 ? 'spesa' : 'spese'}</span><b class="num">${fmt(sum(outs.map(e => e.amount)))}</b></div>`}
+    ${ins.length || ui.listCat === 'income' ? `<div class="month-total"><span class="muted">${ins.length} ${ins.length === 1 ? 'stipendio' : 'stipendi'}</span><b class="num in">+${fmt(sum(ins.map(e => e.amount)))}</b></div>` : ''}
+    ${body || '<p class="empty">Nessun movimento in questo mese.</p>'}`;
 }
 
 /* ---------- Editor (bottom sheet) ---------- */
 
-function openEditor(id) {
+function openEditor(id, kind = 'expense') {
   const e = id ? records.get(id) : null;
+  if (e) kind = e.type;
   const cats = categories();
-  if (e && !cats.some(c => c.id === e.catId)) cats.push(catInfo(e.catId));
+  if (e && !isIncome(e) && !cats.some(c => c.id === e.catId)) cats.push(catInfo(e.catId));
   const selected = e ? e.catId : pref.get('lastCat');
   const name = pref.get('name');
   const names = people();
@@ -398,27 +436,45 @@ function openEditor(id) {
     <form id="expense-form" autocomplete="off">
       <div class="sheet-head">
         <button type="button" class="link" data-action="close">Annulla</button>
-        <h2 id="sheet-title">${e ? 'Modifica spesa' : 'Nuova spesa'}</h2>
+        <h2 id="sheet-title"></h2>
         <button type="submit" class="link">Salva</button>
       </div>
+      ${e ? '' : `<div class="seg" id="kind-seg" role="group" aria-label="Tipo di movimento">
+        <button type="button" data-action="editor-kind" data-value="expense">🧾 Spesa</button>
+        <button type="button" data-action="editor-kind" data-value="income">💶 Stipendio</button>
+      </div>`}
       <input class="amount" name="amount" inputmode="decimal" placeholder="0,00 €" value="${e ? centsToInput(e.amount) : ''}" aria-label="Importo in euro">
-      <div class="chips" role="radiogroup" aria-label="Categoria">
+      <div class="chips" id="cat-chips" role="radiogroup" aria-label="Categoria">
         ${cats.map(c => `<label class="chip"><input type="radio" name="cat" value="${c.id}" ${c.id === selected ? 'checked' : ''}>
           <span><em>${esc(c.icon)}</em>${esc(c.name)}</span></label>`).join('')}
       </div>
       <div class="form-grid">
         <label>Data<input class="field" type="date" name="date" value="${e ? e.date : today()}" required></label>
-        <label>Chi ha pagato<input class="field" name="who" list="people" value="${esc(e ? e.who : name)}"></label>
+        <label><span id="who-label"></span><input class="field" name="who" list="people" value="${esc(e ? e.who : name)}"></label>
       </div>
       <datalist id="people">${names.map(p => `<option value="${esc(p)}">`).join('')}</datalist>
-      <label class="full">Nota (facoltativa)<input class="field" name="note" value="${esc(e ? e.note : '')}" placeholder="Es. Esselunga, bolletta luce…"></label>
+      <label class="full">Nota (facoltativa)<input class="field" name="note" value="${esc(e ? e.note : '')}"></label>
       <p class="err" id="form-err"></p>
       <button type="submit" class="btn block">Salva</button>
-      ${e ? '<button type="button" class="btn danger block" data-action="delete-expense">Elimina spesa</button>' : ''}
+      ${e ? `<button type="button" class="btn danger block" data-action="delete-expense">Elimina ${KINDS[kind].title}</button>` : ''}
     </form>`;
   sheet.dataset.id = id || '';
+  setEditorKind(kind);
   $('#sheet').hidden = false;
   if (!e) sheet.querySelector('.amount').focus();
+}
+
+// Switches the open editor between "spesa" and "stipendio" without losing what was typed.
+function setEditorKind(kind) {
+  const sheet = $('#sheet .sheet');
+  const k = KINDS[kind];
+  sheet.dataset.kind = kind;
+  $('#sheet-title').textContent = (sheet.dataset.id ? 'Modifica ' : kind === 'income' ? 'Nuovo ' : 'Nuova ') + k.title;
+  $('#cat-chips').hidden = kind === 'income';
+  $('#who-label').textContent = k.who;
+  sheet.querySelector('[name=note]').placeholder = k.note;
+  sheet.querySelectorAll('#kind-seg button').forEach(b => b.setAttribute('aria-pressed', b.dataset.value === kind));
+  $('#form-err').textContent = '';
 }
 
 function closeEditor() {
@@ -431,30 +487,33 @@ async function submitExpense(form) {
   const amount = parseCents(fd.get('amount'));
   const err = $('#form-err');
   if (!(amount > 0)) { err.textContent = 'Inserisci un importo valido.'; return; }
+  const { id, kind } = $('#sheet .sheet').dataset;
   const catId = fd.get('cat');
-  if (!catId) { err.textContent = 'Scegli una categoria.'; return; }
-  const id = $('#sheet .sheet').dataset.id;
-  const rec = id ? { ...records.get(id) } : { id: uid(), type: 'expense', createdAt: Date.now() };
+  if (kind === 'expense' && !catId) { err.textContent = 'Scegli una categoria.'; return; }
+  const rec = id ? { ...records.get(id) } : { id: uid(), type: kind, createdAt: Date.now() };
   Object.assign(rec, {
-    amount, catId,
+    amount,
     date: fd.get('date') || today(),
     note: String(fd.get('note')).trim(),
     who: String(fd.get('who')).trim(),
   });
+  if (kind === 'expense') rec.catId = catId;
   await save(rec);
-  pref.set('lastCat', catId);
+  if (kind === 'expense') pref.set('lastCat', catId);
   closeEditor();
   refresh();
-  toast(id ? 'Spesa aggiornata' : 'Spesa salvata');
+  if (kind === 'income') toast(id ? 'Stipendio aggiornato' : 'Stipendio salvato');
+  else toast(id ? 'Spesa aggiornata' : 'Spesa salvata');
 }
 
 async function deleteExpense() {
-  const id = $('#sheet .sheet').dataset.id;
-  if (!id || !confirm('Eliminare questa spesa?')) return;
+  const { id, kind } = $('#sheet .sheet').dataset;
+  const title = KINDS[kind].title;
+  if (!id || !confirm(`Eliminare questo ${kind === 'income' ? title : 'movimento'}?`)) return;
   await save({ ...records.get(id), deleted: true });
   closeEditor();
   refresh();
-  toast('Spesa eliminata');
+  toast(kind === 'income' ? 'Stipendio eliminato' : 'Spesa eliminata');
 }
 
 /* ---------- Andamento ---------- */
@@ -510,10 +569,11 @@ function barChart(id, bars, ref) {
     <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Grafico a barre">${svg}</svg></div>`;
 }
 
-function tipHTML(title, spent, budget, items) {
+function tipHTML(title, spent, budget, items, earned) {
   const split = items ? perPersonHTML(items) : '';
   return `<b>${esc(title)}</b><br>Speso: ${fmt(spent)}` + (split ? `<br>${split}` : '') +
-    (budget ? `<br>Budget: ${fmt(budget)}<br>${spent > budget ? `⚠ Oltre di ${fmt(spent - budget)}` : `Restano ${fmt(budget - spent)}`}` : '');
+    (budget ? `<br>Budget: ${fmt(budget)}<br>${spent > budget ? `⚠ Oltre di ${fmt(spent - budget)}` : `Restano ${fmt(budget - spent)}`}` : '') +
+    (earned ? `<br>Stipendi: ${fmt(earned)}<br>${earned >= spent ? `Risparmiato: ${fmt(earned - spent)}` : `⚠ Spese oltre gli stipendi di ${fmt(spent - earned)}`}` : '');
 }
 
 function showTip(hit) {
@@ -541,14 +601,18 @@ function renderTrend() {
   const list = byWho(cat ? expenses().filter(e => e.catId === cat) : expenses());
   const annual = cat ? budgetFor(y, cat) : totalBudget(y);
   const monthBudget = Math.round(annual / 12);
+  // Salaries only make sense against all expenses, not a single category.
+  const salaries = cat ? [] : byWho(incomes());
 
   const months = MONTHS.map((name, m) => {
     const from = isoDate(new Date(y, m, 1)), to = isoDate(new Date(y, m + 1, 1));
     const items = list.filter(e => e.date >= from && e.date < to);
     const value = sum(items.map(e => e.amount));
-    return { label: MONTHS_SHORT[m], value, tip: tipHTML(`${name} ${y}`, value, monthBudget, items), name };
+    const earned = sum(salaries.filter(e => e.date >= from && e.date < to).map(e => e.amount));
+    return { label: MONTHS_SHORT[m], value, earned, tip: tipHTML(`${name} ${y}`, value, monthBudget, items, earned), name };
   });
   const yearSpent = sum(months.map(b => b.value));
+  const yearEarned = sum(months.map(b => b.earned));
 
   const thisWeek = startOfWeek(new Date());
   const weekYear = thisWeek.getFullYear();
@@ -572,15 +636,17 @@ function renderTrend() {
     ${navHTML('trend-shift', String(y))}
     <section class="card">
       <h2>Spese mensili</h2>
-      <p class="hint" style="margin:-6px 0 10px">Totale ${y}: <b class="num">${fmt(yearSpent)}</b>${annual ? ` su ${fmt(annual)} di budget annuale` : ''}</p>
+      <p class="hint" style="margin:-6px 0 10px">Totale ${y}: <b class="num">${fmt(yearSpent)}</b>${annual ? ` su ${fmt(annual)} di budget annuale` : ''}
+        ${yearEarned ? `<br>Stipendi ${y}: <b class="num in">${fmt(yearEarned)}</b> · ${yearEarned >= yearSpent ? `risparmiato <b class="num">${fmt(yearEarned - yearSpent)}</b>` : `<span class="warn">spese oltre gli stipendi di ${fmt(yearSpent - yearEarned)}</span>`}` : ''}</p>
       ${key(monthBudget)}
       ${barChart('chart-months', months, monthBudget)}
       <details>
         <summary>Mostra la tabella</summary>
         <table>
-          <thead><tr><th>Mese</th><th>Speso</th><th>Budget</th><th>Diff.</th></tr></thead>
+          <thead><tr><th>Mese</th><th>Speso</th><th>Budget</th><th>Diff.</th>${yearEarned ? '<th>Stipendi</th>' : ''}</tr></thead>
           <tbody>${months.map(b => `<tr><td>${b.name}</td><td>${fmtRound(b.value)}</td><td>${monthBudget ? fmtRound(monthBudget) : '–'}</td>
-            <td>${monthBudget ? (b.value > monthBudget ? '⚠ +' + fmtRound(b.value - monthBudget) : '−' + fmtRound(monthBudget - b.value)) : '–'}</td></tr>`).join('')}</tbody>
+            <td>${monthBudget ? (b.value > monthBudget ? '⚠ +' + fmtRound(b.value - monthBudget) : '−' + fmtRound(monthBudget - b.value)) : '–'}</td>
+            ${yearEarned ? `<td>${b.earned ? fmtRound(b.earned) : '–'}</td>` : ''}</tr>`).join('')}</tbody>
         </table>
       </details>
     </section>
@@ -645,7 +711,7 @@ function renderSettings() {
 
     <section class="card">
       <h2>Esporta per Excel</h2>
-      <button class="btn secondary block" data-action="csv">Esporta le spese del ${y} (CSV)</button>
+      <button class="btn secondary block" data-action="csv">Esporta spese e stipendi del ${y} (CSV)</button>
     </section>
 
     <p class="ver">Conti di Famiglia v${APP_VERSION}</p>`;
@@ -741,9 +807,12 @@ async function importBackup(file) {
   await dbPut(incoming);
   markPending(incoming.map(r => r.id));
   const newExpenses = incoming.filter(r => r.type === 'expense').length;
+  const newIncomes = incoming.filter(isIncome).length;
+  const other = incoming.length - newExpenses - newIncomes;
   alert(incoming.length
     ? `Importazione completata${data.by ? ' dal backup di ' + data.by : ''}: ${newExpenses} ${newExpenses === 1 ? 'spesa nuova o modificata' : 'spese nuove o modificate'}` +
-      (incoming.length > newExpenses ? `, più ${incoming.length - newExpenses} modifiche a budget e categorie.` : '.')
+      (newIncomes ? `, ${newIncomes} ${newIncomes === 1 ? 'stipendio nuovo o modificato' : 'stipendi nuovi o modificati'}` : '') +
+      (other ? `, più ${other} modifiche a budget e categorie.` : '.')
     : 'Nessuna novità: i dati erano già allineati.');
   refresh();
 }
@@ -751,12 +820,15 @@ async function importBackup(file) {
 function exportCSV() {
   const y = ui.budgetYear;
   const q = s => `"${String(s ?? '').replace(/"/g, '""')}"`;
-  const rows = expensesBetween(`${y}-01-01`, `${y + 1}-01-01`).sort((a, b) => a.date.localeCompare(b.date));
-  const lines = ['Data;Categoria;Importo;Nota;Chi'].concat(rows.map(e => {
+  const from = `${y}-01-01`, to = `${y + 1}-01-01`;
+  const rows = [...expensesBetween(from, to), ...incomesBetween(from, to)].sort((a, b) => a.date.localeCompare(b.date));
+  const lines = ['Data;Tipo;Categoria;Importo;Nota;Chi'].concat(rows.map(e => {
     const [yy, mm, dd] = e.date.split('-');
-    return [`${dd}/${mm}/${yy}`, q(catInfo(e.catId).name), (e.amount / 100).toFixed(2).replace('.', ','), q(e.note), q(e.who)].join(';');
+    const income = isIncome(e);
+    return [`${dd}/${mm}/${yy}`, income ? 'Stipendio' : 'Spesa', q(income ? '' : catInfo(e.catId).name),
+      (e.amount / 100).toFixed(2).replace('.', ','), q(e.note), q(e.who)].join(';');
   }));
-  shareOrDownload(new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv' }), `spese-${y}.csv`);
+  shareOrDownload(new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv' }), `movimenti-${y}.csv`);
 }
 
 /* ---------- Sync ----------
@@ -898,10 +970,11 @@ async function runSync() {
 
 function onRemoteChanges(changed) {
   const me = pref.get('name');
-  const fromOthers = changed.filter(r => r.type === 'expense' && r.who && r.who !== me);
+  const fromOthers = changed.filter(r => (r.type === 'expense' || isIncome(r)) && r.who && r.who !== me);
   if (fromOthers.length) {
     const names = [...new Set(fromOthers.map(r => r.who))].join(' e ');
-    toast(fromOthers.length === 1 ? `Nuova spesa da ${names}` : `${fromOthers.length} aggiornamenti da ${names}`);
+    const what = isIncome(fromOthers[0]) ? 'Nuovo stipendio' : 'Nuova spesa';
+    toast(fromOthers.length === 1 ? `${what} da ${names}` : `${fromOthers.length} aggiornamenti da ${names}`);
   }
   // Don't redraw under the user's fingers: the sheet or a settings field being edited.
   const editing = !$('#sheet').hidden || (ui.view === 'settings' && document.activeElement && document.activeElement.matches('input, select'));
@@ -1008,6 +1081,7 @@ function bindEvents() {
       case 'go': show(el.dataset.view); break;
       case 'add': openEditor(null); break;
       case 'edit': openEditor(el.dataset.id); break;
+      case 'editor-kind': setEditorKind(el.dataset.value); break;
       case 'close': closeEditor(); refresh(); break;
       case 'sync-now': scheduleSync(0); break;
       case 'sync-off': disableSync(); break;
